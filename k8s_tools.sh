@@ -17,9 +17,14 @@
 #   K9S_VERSION=v0.32.7      KUBECTX_VERSION=v0.9.5  STERN_VERSION=v1.31.0
 #
 # k3s on RHEL-family / Fedora:
-#   - installs container-selinux before the k3s installer (needed for SELinux labeling)
-#   - relabels /usr/local/bin/k3s with restorecon and verifies the label
-#   - opens firewalld ports/zones automatically when firewalld is running
+#   - installs container-selinux before the k3s installer
+#   - checks the *runtime* SELinux state (getenforce) vs /etc/selinux/config.
+#     If SELinux is configured "enforcing" but is not actually enforcing right now
+#     (e.g. Disabled on many VPS images), the installer's labeling step cannot work,
+#     so the script passes INSTALL_K3S_SELINUX_WARN=true to let it continue.
+#   - if the installer fails while SELinux is enforcing, it reloads the policy,
+#     relabels the binary, retries once, then falls back to warn-only mode.
+#   - opens firewalld ports/zones automatically when firewalld is running.
 #   Set K3S_SKIP_FIREWALLD=1 to skip the firewalld changes.
 
 set -euo pipefail
@@ -186,8 +191,23 @@ install_minikube() {
 }
 
 # ---- k3s helpers (RHEL family / Fedora) -------------------------------------
+# Runtime SELinux mode: Enforcing, Permissive or Disabled.
+selinux_runtime() {
+  if command -v getenforce >/dev/null 2>&1; then
+    getenforce 2>/dev/null || echo "Disabled"
+  else
+    echo "Disabled"
+  fi
+}
+
+# SELinux mode configured for the next boot (enforcing, permissive, disabled, or empty).
+selinux_config() {
+  [[ -r /etc/selinux/config ]] || return 0
+  sed -n 's/^SELINUX=\([a-zA-Z]*\).*/\1/p' /etc/selinux/config | head -n1 | tr '[:upper:]' '[:lower:]'
+}
+
 selinux_enforcing() {
-  command -v getenforce >/dev/null 2>&1 && [[ "$(getenforce)" == "Enforcing" ]]
+  [[ "$(selinux_runtime)" == "Enforcing" ]]
 }
 
 # container-selinux provides the container_runtime_exec_t type that k3s-selinux
@@ -241,7 +261,20 @@ fix_k3s_selinux_label() {
     ok "k3s binary has the container_runtime_exec_t label"
   else
     warn "k3s binary is not labeled container_runtime_exec_t. Check: ls -Z /usr/local/bin/k3s"
-    warn "Try: sudo dnf reinstall -y k3s-selinux container-selinux && sudo restorecon -v /usr/local/bin/k3s"
+  fi
+}
+
+# Run the official installer from a saved copy so it can be retried.
+#   $1 = "warn" to add INSTALL_K3S_SELINUX_WARN=true
+run_k3s_installer() {
+  local envs=()
+  [[ -n "${K3S_VERSION:-}" ]] && envs+=("INSTALL_K3S_VERSION=$K3S_VERSION")
+  [[ "${1:-}" == "warn" ]]    && envs+=("INSTALL_K3S_SELINUX_WARN=true")
+
+  if [[ ${#envs[@]} -gt 0 ]]; then
+    $SUDO env "${envs[@]}" sh "$TMP/k3s-install.sh"
+  else
+    $SUDO sh "$TMP/k3s-install.sh"
   fi
 }
 
@@ -249,19 +282,49 @@ install_k3s() {
   log "Installing k3s"
   command -v systemctl >/dev/null 2>&1 || die "k3s installer expects systemd (systemctl not found)."
 
-  if [[ "$family" == "fedora" || "$family" == "rhel" ]]; then
-    # Must come before the k3s installer so the SELinux labeling succeeds.
+  local selinux_mode="warn-not-needed"   # "warn" => pass INSTALL_K3S_SELINUX_WARN=true
+  local rpm_family=0
+  [[ "$family" == "fedora" || "$family" == "rhel" ]] && rpm_family=1
+
+  if [[ $rpm_family -eq 1 ]]; then
+    # Must come before the k3s installer so the SELinux labeling can succeed.
     install_container_selinux
     configure_firewalld_for_k3s
-    if selinux_enforcing; then
-      log "SELinux is enforcing; the k3s installer will add the k3s-selinux policy."
+
+    local rt cfg
+    rt="$(selinux_runtime)"
+    cfg="$(selinux_config)"
+    log "SELinux runtime: $rt, configured: ${cfg:-unknown}"
+
+    if [[ "$rt" != "Enforcing" && "$cfg" == "enforcing" ]]; then
+      # The installer's chcon step cannot work when SELinux isn't active, but it
+      # still insists on it because the config says "enforcing".
+      warn "SELinux is configured 'enforcing' but is currently $rt, so labeling the k3s binary is impossible."
+      warn "Continuing with INSTALL_K3S_SELINUX_WARN=true. To fix SELinux itself, set SELINUX=permissive"
+      warn "in /etc/selinux/config, reboot (a relabel runs on boot), then rerun this script."
+      selinux_mode="warn"
     fi
   fi
 
-  # Official installer; INSTALL_K3S_VERSION is only passed when K3S_VERSION is set.
-  curl -sfL https://get.k3s.io | $SUDO env ${K3S_VERSION:+INSTALL_K3S_VERSION="$K3S_VERSION"} sh -s -
+  # Save the official installer so it can be retried.
+  curl -sfL https://get.k3s.io -o "$TMP/k3s-install.sh" || die "Could not download the k3s installer."
 
-  if [[ "$family" == "fedora" || "$family" == "rhel" ]]; then
+  if ! run_k3s_installer "$selinux_mode"; then
+    [[ $rpm_family -eq 1 ]] || die "k3s installer failed."
+
+    warn "k3s installer failed. Reloading SELinux policy, relabeling and retrying once."
+    $SUDO dnf reinstall -y container-selinux k3s-selinux >/dev/null 2>&1 || true
+    $SUDO semodule -B >/dev/null 2>&1 || true
+    [[ -e /usr/local/bin/k3s ]] && $SUDO restorecon -v /usr/local/bin/k3s >/dev/null 2>&1 || true
+
+    if ! run_k3s_installer "$selinux_mode"; then
+      warn "Still failing. Retrying with INSTALL_K3S_SELINUX_WARN=true (k3s will run without its SELinux label)."
+      run_k3s_installer warn || die "k3s installer failed. Check: journalctl -u k3s -e"
+      selinux_mode="warn"
+    fi
+  fi
+
+  if [[ $rpm_family -eq 1 ]]; then
     fix_k3s_selinux_label
     # Restart so the service starts with the corrected label.
     $SUDO systemctl restart k3s || warn "Could not restart k3s; check: sudo systemctl status k3s"
