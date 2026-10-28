@@ -15,6 +15,12 @@
 #   KUBECTL_VERSION=v1.31.2  HELM_VERSION=v3.16.2  KIND_VERSION=v0.24.0
 #   MINIKUBE_VERSION=v1.34.0 K3S_VERSION=v1.31.2+k3s1
 #   K9S_VERSION=v0.32.7      KUBECTX_VERSION=v0.9.5  STERN_VERSION=v1.31.0
+#
+# k3s on RHEL-family / Fedora:
+#   - installs container-selinux before the k3s installer (needed for SELinux labeling)
+#   - relabels /usr/local/bin/k3s with restorecon and verifies the label
+#   - opens firewalld ports/zones automatically when firewalld is running
+#   Set K3S_SKIP_FIREWALLD=1 to skip the firewalld changes.
 
 set -euo pipefail
 
@@ -179,23 +185,87 @@ install_minikube() {
   [[ $EUID -eq 0 ]] && warn "minikube's docker driver refuses to run as root; start it as a normal user."
 }
 
+# ---- k3s helpers (RHEL family / Fedora) -------------------------------------
+selinux_enforcing() {
+  command -v getenforce >/dev/null 2>&1 && [[ "$(getenforce)" == "Enforcing" ]]
+}
+
+# container-selinux provides the container_runtime_exec_t type that k3s-selinux
+# needs; without it the installer fails to label /usr/local/bin/k3s.
+install_container_selinux() {
+  if rpm -q container-selinux >/dev/null 2>&1; then
+    log "container-selinux already installed"
+    return 0
+  fi
+
+  log "Installing container-selinux"
+  if $SUDO dnf install -y container-selinux; then
+    return 0
+  fi
+
+  warn "container-selinux not found; enabling extra repos and retrying."
+  $SUDO dnf install -y dnf-plugins-core || true
+  $SUDO dnf config-manager --set-enabled crb appstream extras >/dev/null 2>&1 || true
+  $SUDO dnf install -y container-selinux \
+    || die "Could not install container-selinux. Enable the AppStream/extras repos and retry."
+
+  # If k3s-selinux was installed earlier (without its dependency), reinstall it.
+  if rpm -q k3s-selinux >/dev/null 2>&1; then
+    $SUDO dnf reinstall -y k3s-selinux || true
+  fi
+}
+
+# Open the ports K3s needs and trust the pod/service CIDRs.
+configure_firewalld_for_k3s() {
+  [[ "${K3S_SKIP_FIREWALLD:-0}" == "1" ]] && return 0
+  systemctl is-active --quiet firewalld 2>/dev/null || return 0
+  command -v firewall-cmd >/dev/null 2>&1 || return 0
+
+  log "firewalld is active; opening ports for k3s"
+  $SUDO firewall-cmd --permanent --add-port=6443/tcp --add-port=10250/tcp
+  $SUDO firewall-cmd --permanent --zone=trusted --add-source=10.42.0.0/16   # pods
+  $SUDO firewall-cmd --permanent --zone=trusted --add-source=10.43.0.0/16   # services
+  $SUDO firewall-cmd --reload
+  ok "firewalld configured for k3s"
+}
+
+# Make sure the k3s binary carries the SELinux label k3s-selinux expects.
+fix_k3s_selinux_label() {
+  selinux_enforcing || return 0
+  command -v restorecon >/dev/null 2>&1 || return 0
+  [[ -e /usr/local/bin/k3s ]] || return 0
+
+  $SUDO restorecon -v /usr/local/bin/k3s || true
+
+  if ls -Z /usr/local/bin/k3s 2>/dev/null | grep -q container_runtime_exec_t; then
+    ok "k3s binary has the container_runtime_exec_t label"
+  else
+    warn "k3s binary is not labeled container_runtime_exec_t. Check: ls -Z /usr/local/bin/k3s"
+    warn "Try: sudo dnf reinstall -y k3s-selinux container-selinux && sudo restorecon -v /usr/local/bin/k3s"
+  fi
+}
+
 install_k3s() {
   log "Installing k3s"
   command -v systemctl >/dev/null 2>&1 || die "k3s installer expects systemd (systemctl not found)."
 
-  # Fedora/Rocky: firewalld commonly blocks pod and service traffic.
   if [[ "$family" == "fedora" || "$family" == "rhel" ]]; then
-    if systemctl is-active --quiet firewalld 2>/dev/null; then
-      warn "firewalld is active. K3s docs recommend disabling it, or opening 6443/tcp, 10250/tcp"
-      warn "and trusting 10.42.0.0/16 (pods) and 10.43.0.0/16 (services)."
-    fi
-    if command -v getenforce >/dev/null 2>&1 && [[ "$(getenforce)" == "Enforcing" ]]; then
+    # Must come before the k3s installer so the SELinux labeling succeeds.
+    install_container_selinux
+    configure_firewalld_for_k3s
+    if selinux_enforcing; then
       log "SELinux is enforcing; the k3s installer will add the k3s-selinux policy."
     fi
   fi
 
   # Official installer; INSTALL_K3S_VERSION is only passed when K3S_VERSION is set.
   curl -sfL https://get.k3s.io | $SUDO env ${K3S_VERSION:+INSTALL_K3S_VERSION="$K3S_VERSION"} sh -s -
+
+  if [[ "$family" == "fedora" || "$family" == "rhel" ]]; then
+    fix_k3s_selinux_label
+    # Restart so the service starts with the corrected label.
+    $SUDO systemctl restart k3s || warn "Could not restart k3s; check: sudo systemctl status k3s"
+  fi
 
   # Give the invoking (non-root) user a kubeconfig, without overwriting an existing one.
   local user="${SUDO_USER:-}"
