@@ -21,3 +21,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/fadedreams/cfg_server/main/p
 ``` bash
 bash <(curl -fsSL https://raw.githubusercontent.com/fadedreams/cfg_server/main/rust.sh)
 ```
+
+``` bash
+bash <(curl -fsSL https://raw.githubusercontent.com/fadedreams/cfg_server/main/php.sh)
+```
