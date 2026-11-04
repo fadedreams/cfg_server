@@ -4,12 +4,12 @@
 # Supported: Ubuntu, Debian, Fedora, Rocky/Alma/RHEL/CentOS, Arch (and derivatives)
 #
 # Usage:
-#   sudo ./install-go.sh              # interactive: pick from the list or type a version
-#   sudo ./install-go.sh 1.23.4       # non-interactive: install a specific version
-#   ./install-go.sh --list            # just show the 10 latest stable versions
+#   sudo ./install-go.sh            # interactive: pick from the list or type a version
+#   sudo ./install-go.sh 1.23.4     # non-interactive: install a specific version
+#   ./install-go.sh --list          # just show the 10 latest stable versions
 #
 # Env:
-#   INSTALL_DIR=/usr/local            # Go ends up in $INSTALL_DIR/go
+#   INSTALL_DIR=/usr/local          # Go ends up in $INSTALL_DIR/go
 
 set -euo pipefail
 
@@ -25,9 +25,10 @@ usage() {
 INSTALL_DIR="${INSTALL_DIR:-/usr/local}"
 API_URL="https://go.dev/dl/?mode=json&include=all"
 DL_BASE="https://go.dev/dl"
-
+PROFILE_SCRIPT="/etc/profile.d/golang.sh"
 REQUESTED=""
 LIST_ONLY=0
+
 for arg in "$@"; do
   case "$arg" in
     -h|--help) usage; exit 0 ;;
@@ -37,184 +38,155 @@ for arg in "$@"; do
   esac
 done
 
-# ---- root / sudo ------------------------------------------------------------
-if [[ $EUID -ne 0 ]]; then
-  if command -v sudo >/dev/null 2>&1; then SUDO="sudo"; else SUDO=""; fi
-else
-  SUDO=""
-fi
+# ---------------------------------------------------------------- distro ----
+detect_distro() {
+  [ -r /etc/os-release ] || die "Cannot detect distro: /etc/os-release not found"
+  # shellcheck disable=SC1091
+  . /etc/os-release
+  DISTRO_ID="${ID:-unknown}"
+  DISTRO_LIKE="${ID_LIKE:-}"
+  case "$DISTRO_ID $DISTRO_LIKE" in
+    *ubuntu*|*debian*)                    PKG="apt" ;;
+    *fedora*)                             PKG="dnf" ;;
+    *rhel*|*centos*|*rocky*|*almalinux*)  PKG="dnf" ;;
+    *arch*)                               PKG="pacman" ;;
+    *) die "Unsupported distro: $DISTRO_ID" ;;
+  esac
+  log "Detected distro: ${PRETTY_NAME:-$DISTRO_ID} (package manager: $PKG)"
+}
 
-# ---- detect distro ----------------------------------------------------------
-[[ -r /etc/os-release ]] || die "/etc/os-release not found; can't detect distro."
-# shellcheck disable=SC1091
-. /etc/os-release
-DISTRO="${ID:-unknown}"
-LIKE="${ID_LIKE:-}"
-
-family=""
-case "$DISTRO" in
-  ubuntu|debian|linuxmint|pop|elementary|zorin|raspbian) family="debian" ;;
-  fedora)                                                family="fedora" ;;
-  rocky|almalinux|rhel|centos|ol)                        family="rhel"   ;;
-  arch|manjaro|endeavouros)                              family="arch"   ;;
-  *)
-    case " $LIKE " in
-      *" ubuntu "*|*" debian "*) family="debian" ;;
-      *" fedora "*)              family="fedora" ;;
-      *" rhel "*|*" centos "*)   family="rhel"   ;;
-      *" arch "*)                family="arch"   ;;
-      *) die "Unsupported distro: $DISTRO (ID_LIKE='$LIKE')" ;;
-    esac
-    ;;
-esac
-
-# ---- detect CPU architecture (Go's naming) ----------------------------------
-case "$(uname -m)" in
-  x86_64|amd64)   ARCH="amd64"   ;;
-  aarch64|arm64)  ARCH="arm64"   ;;
-  armv6l|armv7l)  ARCH="armv6l"  ;;
-  i386|i686)      ARCH="386"     ;;
-  ppc64le)        ARCH="ppc64le" ;;
-  s390x)          ARCH="s390x"   ;;
-  riscv64)        ARCH="riscv64" ;;
-  *) die "Unsupported CPU architecture: $(uname -m)" ;;
-esac
-
-log "Detected: ${PRETTY_NAME:-$DISTRO} (family: $family, arch: $ARCH)"
-
-# ---- prerequisites ----------------------------------------------------------
-install_prereqs() {
+install_deps() {
   local missing=()
-  for c in curl tar jq sha256sum; do
-    command -v "$c" >/dev/null 2>&1 || missing+=("$c")
-  done
-  [[ ${#missing[@]} -eq 0 ]] && return 0
+  command -v curl >/dev/null 2>&1 || missing+=(curl)
+  command -v tar  >/dev/null 2>&1 || missing+=(tar)
+  command -v sha256sum >/dev/null 2>&1 || missing+=(coreutils)
+  [ "${#missing[@]}" -eq 0 ] && return 0
 
-  [[ -n "$SUDO" || $EUID -eq 0 ]] || die "Missing tools (${missing[*]}) and no sudo available to install them."
-  log "Installing prerequisites: ${missing[*]}"
-  case "$family" in
-    debian)      $SUDO apt-get update -y && $SUDO apt-get install -y curl tar jq coreutils ca-certificates ;;
-    fedora|rhel) $SUDO dnf install -y curl tar jq coreutils ca-certificates ;;
-    arch)        $SUDO pacman -Sy --noconfirm --needed curl tar jq coreutils ca-certificates ;;
+  log "Installing missing dependencies: ${missing[*]}"
+  case "$PKG" in
+    apt)    apt-get update -qq && apt-get install -y -qq "${missing[@]}" ;;
+    dnf)    dnf install -y -q "${missing[@]}" ;;
+    pacman) pacman -Sy --noconfirm --needed "${missing[@]}" ;;
   esac
 }
-install_prereqs
 
-# ---- fetch release list -----------------------------------------------------
-log "Fetching Go releases from go.dev"
-JSON="$(curl -fsSL "$API_URL")" || die "Could not fetch $API_URL"
+# ------------------------------------------------------------------ arch ----
+detect_arch() {
+  case "$(uname -m)" in
+    x86_64|amd64)   GOARCH="amd64" ;;
+    aarch64|arm64)  GOARCH="arm64" ;;
+    armv6l|armv7l)  GOARCH="armv6l" ;;
+    i386|i686)      GOARCH="386" ;;
+    *) die "Unsupported architecture: $(uname -m)" ;;
+  esac
+}
 
-mapfile -t VERSIONS < <(jq -r '[.[] | select(.stable == true)] | .[0:10] | .[].version' <<<"$JSON")
-[[ ${#VERSIONS[@]} -gt 0 ]] || die "Could not parse the release list."
+# -------------------------------------------------------------- versions ----
+# Prints the 10 latest stable versions (without the "go" prefix), newest first.
+latest_versions() {
+  curl -fsSL "$API_URL" \
+    | grep -oE '"version": *"go[0-9]+\.[0-9]+(\.[0-9]+)?"' \
+    | sed -E 's/.*"go([^"]+)"/\1/' \
+    | awk '!seen[$0]++' \
+    | head -n 10
+}
 
-# Currently installed version (if any)
-CURRENT=""
-if [[ -x "$INSTALL_DIR/go/bin/go" ]]; then
-  CURRENT="$("$INSTALL_DIR/go/bin/go" version 2>/dev/null | awk '{print $3}')" || true
-elif command -v go >/dev/null 2>&1; then
-  CURRENT="$(go version 2>/dev/null | awk '{print $3}')" || true
-fi
+pick_version() {
+  log "Fetching the 10 latest stable Go releases from go.dev ..."
+  mapfile -t VERSIONS < <(latest_versions)
+  [ "${#VERSIONS[@]}" -gt 0 ] || die "Could not fetch version list from go.dev"
 
-print_list() {
   echo
-  echo "10 latest stable Go versions:"
-  local i=1 v tag
+  local i=1
   for v in "${VERSIONS[@]}"; do
-    tag=""
-    [[ "$v" == "${VERSIONS[0]}" ]] && tag=" (latest)"
-    [[ -n "$CURRENT" && "$v" == "$CURRENT" ]] && tag="$tag (installed)"
-    printf '  %2d) %s%s\n' "$i" "${v#go}" "$tag"
+    printf '  %2d) go%s\n' "$i" "$v"
     i=$((i + 1))
   done
   echo
-  if [[ -n "$CURRENT" ]]; then
-    echo "Currently installed: ${CURRENT#go}"
-    echo
+
+  if [ "$LIST_ONLY" -eq 1 ]; then
+    exit 0
   fi
-  return 0
+
+  local choice
+  read -r -p "Pick a number (1-${#VERSIONS[@]}) or type a version [1]: " choice </dev/tty
+  choice="${choice:-1}"
+
+  if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "${#VERSIONS[@]}" ]; then
+    VERSION="${VERSIONS[$((choice - 1))]}"
+  else
+    VERSION="${choice#go}"
+  fi
 }
 
-if [[ $LIST_ONLY -eq 1 ]]; then
-  print_list
-  exit 0
-fi
+# --------------------------------------------------------------- install ----
+install_go() {
+  local file="go${VERSION}.linux-${GOARCH}.tar.gz"
+  local url="${DL_BASE}/${file}"
+  local tmp
+  tmp="$(mktemp -d)"
+  trap 'rm -rf "$tmp"' EXIT
 
-# ---- choose version ---------------------------------------------------------
-normalize() {
-  # accepts 1.23.4, go1.23.4, v1.23.4 -> go1.23.4
-  local v="$1"
-  v="${v#v}"; v="${v#go}"
-  echo "go${v}"
-}
+  log "Downloading ${file}"
+  curl -fL --progress-bar -o "${tmp}/${file}" "$url" \
+    || die "Download failed: $url (does version ${VERSION} exist?)"
 
-CHOSEN=""
-if [[ -n "$REQUESTED" ]]; then
-  CHOSEN="$(normalize "$REQUESTED")"
-else
-  [[ -t 0 ]] || die "No version given and no terminal for the menu. Pass a version: ./install-go.sh 1.23.4"
-  print_list
-  while [[ -z "$CHOSEN" ]]; do
-    read -rp "Pick 1-${#VERSIONS[@]}, type a version (e.g. 1.22.8), or q to quit [1]: " answer
-    answer="${answer:-1}"
-    case "$answer" in
-      q|Q) log "Cancelled."; exit 0 ;;
-      *[!0-9]*|"")
-        CHOSEN="$(normalize "$answer")"
-        ;;
-      *)
-        if (( answer >= 1 && answer <= ${#VERSIONS[@]} )); then
-          CHOSEN="${VERSIONS[$((answer - 1))]}"
-        else
-          warn "Number out of range."
-        fi
-        ;;
-    esac
-  done
-fi
+  log "Verifying SHA256 checksum"
+  local expected actual
+  expected="$(curl -fsSL "${url}.sha256" | tr -d '[:space:]')" \
+    || die "Could not fetch checksum for ${file}"
+  actual="$(sha256sum "${tmp}/${file}" | awk '{print $1}')"
+  [ "$expected" = "$actual" ] || die "Checksum mismatch! expected=$expected actual=$actual"
+  ok "Checksum OK"
 
-# ---- look up the file + checksum for this version/arch ----------------------
-FILENAME="${CHOSEN}.linux-${ARCH}.tar.gz"
-SHA256="$(jq -r --arg v "$CHOSEN" --arg f "$FILENAME" \
-  '.[] | select(.version == $v) | .files[] | select(.filename == $f) | .sha256' <<<"$JSON" | head -n1)"
+  log "Installing to ${INSTALL_DIR}/go"
+  rm -rf "${INSTALL_DIR}/go"
+  mkdir -p "$INSTALL_DIR"
+  tar -C "$INSTALL_DIR" -xzf "${tmp}/${file}"
 
-if [[ -z "$SHA256" ]]; then
-  die "No official linux/${ARCH} build found for '${CHOSEN#go}'. Check the version (note: Go 1.20 and older use e.g. 1.20, not 1.20.0)."
-fi
-
-if [[ "$CHOSEN" == "$CURRENT" ]]; then
-  warn "${CHOSEN#go} is already installed; reinstalling."
-fi
-
-# ---- download, verify, install ----------------------------------------------
-TMP="$(mktemp -d)"
-trap 'rm -rf "$TMP"' EXIT
-
-log "Downloading $FILENAME"
-curl -fSL --progress-bar -o "$TMP/$FILENAME" "$DL_BASE/$FILENAME"
-
-log "Verifying SHA256 checksum"
-echo "$SHA256  $TMP/$FILENAME" | sha256sum -c - >/dev/null || die "Checksum verification failed."
-ok "Checksum OK"
-
-[[ -n "$INSTALL_DIR" && "$INSTALL_DIR" != "/" ]] || die "Refusing to use INSTALL_DIR='$INSTALL_DIR'."
-log "Installing to $INSTALL_DIR/go"
-$SUDO mkdir -p "$INSTALL_DIR"
-$SUDO rm -rf "$INSTALL_DIR/go"
-$SUDO tar -C "$INSTALL_DIR" -xzf "$TMP/$FILENAME"
-
-# ---- PATH setup -------------------------------------------------------------
-PROFILE_FILE="/etc/profile.d/golang.sh"
-# $INSTALL_DIR/go/bin is not on PATH by default
-$SUDO tee "$PROFILE_FILE" >/dev/null <<EOF
+  # Persist PATH for all login shells
+  cat > "$PROFILE_SCRIPT" <<EOF
 # Added by install-go.sh
-export PATH="\$PATH:$INSTALL_DIR/go/bin:\$HOME/go/bin"
+case ":\$PATH:" in
+  *":${INSTALL_DIR}/go/bin:"*) ;;
+  *) export PATH="\$PATH:${INSTALL_DIR}/go/bin" ;;
+esac
 EOF
-$SUDO chmod 0644 "$PROFILE_FILE"
+  chmod 644 "$PROFILE_SCRIPT"
 
-# ---- verify -----------------------------------------------------------------
-"$INSTALL_DIR/go/bin/go" version >/dev/null 2>&1 || die "Install finished but the go binary doesn't run."
-ok "$("$INSTALL_DIR/go/bin/go" version)"
-echo
-log "PATH is set via $PROFILE_FILE. Apply it now with:"
-echo "    source $PROFILE_FILE"
-echo "or open a new login shell. Then check with: go version"
+  # Apply PATH inside this script so the version check below works
+  # shellcheck disable=SC1091
+  source "$PROFILE_SCRIPT"
+
+  ok "$(go version)"
+  echo
+  log "PATH is set via ${PROFILE_SCRIPT}."
+  warn "Your current terminal is not updated (a script can't change its parent shell)."
+  warn "Run now:  source ${PROFILE_SCRIPT}   (or open a new login shell)"
+}
+
+# ------------------------------------------------------------------ main ----
+main() {
+  if [ "$LIST_ONLY" -eq 1 ]; then
+    command -v curl >/dev/null 2>&1 || die "curl is required"
+    pick_version
+    exit 0
+  fi
+
+  [ "$(id -u)" -eq 0 ] || die "Run as root: sudo $0 ${REQUESTED}"
+
+  detect_distro
+  install_deps
+  detect_arch
+
+  if [ -n "$REQUESTED" ]; then
+    VERSION="${REQUESTED#go}"
+  else
+    pick_version
+  fi
+
+  log "Selected: go${VERSION} (linux/${GOARCH})"
+  install_go
+}
+
+main
