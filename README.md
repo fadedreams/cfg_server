@@ -23,5 +23,5 @@ bash <(curl -fsSL https://raw.githubusercontent.com/fadedreams/cfg_server/main/r
 ```
 
 ``` bash
-bash <(curl -fsSL https://raw.githubusercontent.com/fadedreams/cfg_server/main/php.sh)
+curl -fsSL https://raw.githubusercontent.com/fadedreams/cfg_server/main/php.sh | sudo bash
 ```
