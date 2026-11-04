@@ -17,3 +17,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/fadedreams/cfg_server/main/n
 ``` bash
 bash <(curl -fsSL https://raw.githubusercontent.com/fadedreams/cfg_server/main/py_venv_pip_uv.sh)
 ```
+
+``` bash
+bash <(curl -fsSL https://raw.githubusercontent.com/fadedreams/cfg_server/main/rust.sh)
+```
