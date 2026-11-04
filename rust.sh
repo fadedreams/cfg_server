@@ -135,7 +135,7 @@ install_rust() {
   local url="${DIST_BASE}/${TARGET}/rustup-init"
   local tmp
   tmp="$(mktemp -d)"
-  trap 'rm -rf "$tmp"' EXIT
+  trap "rm -rf '$tmp'" EXIT
 
   log "Downloading rustup-init (${TARGET})"
   curl -fL --progress-bar -o "${tmp}/rustup-init" "$url" \
