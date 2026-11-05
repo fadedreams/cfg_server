@@ -77,6 +77,10 @@ apt_install_with_repair() {
   local pkg="$1"
   local APT="$SUDO env DEBIAN_FRONTEND=noninteractive apt-get"
 
+  # Minimal Debian/containers may lack this dir; the JRE post-install
+  # (update-alternatives) fails with "java.1.gz.dpkg-tmp: No such file".
+  $SUDO mkdir -p /usr/share/man/man1
+
   # Fix leftovers from any earlier interrupted/failed install first.
   $SUDO dpkg --configure -a || true
 
