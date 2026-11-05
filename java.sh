@@ -71,6 +71,37 @@ pkg_name() {
   esac
 }
 
+# apt install that heals half-configured packages (e.g. openjdk-*-jre-headless
+# failing in its post-install step) and retries once before giving up.
+apt_install_with_repair() {
+  local pkg="$1"
+  local APT="$SUDO env DEBIAN_FRONTEND=noninteractive apt-get"
+
+  # Fix leftovers from any earlier interrupted/failed install first.
+  $SUDO dpkg --configure -a || true
+
+  # ca-certificates is needed by ca-certificates-java, which the JRE's
+  # post-install step runs; installing it first avoids a common failure.
+  if $APT install -y ca-certificates "$pkg"; then
+    return 0
+  fi
+
+  warn "Install failed; attempting repair (dpkg --configure -a, apt-get -f install)..."
+  $SUDO dpkg --configure -a || true
+  if $APT -f install -y && $APT install -y "$pkg"; then
+    ok "Recovered after repair."
+    return 0
+  fi
+
+  warn "Still failing. Diagnostics:"
+  $SUDO dpkg --audit >&2 || true
+  [[ -r /var/log/apt/term.log ]] && tail -n 40 /var/log/apt/term.log >&2 || true
+  if [[ -f /proc/1/environ ]] && grep -qaE 'container=|WSL' /proc/1/environ 2>/dev/null; then
+    warn "Looks like a container/WSL environment; check the first error printed by 'dpkg --configure -a'."
+  fi
+  die "Could not install $pkg. Run 'sudo dpkg --configure -a' and read the FIRST error."
+}
+
 # ---------- main function ----------
 
 install_java() {
@@ -89,7 +120,7 @@ install_java() {
         apt-cache search --names-only '^openjdk-[0-9]+-jdk$' | sort -V >&2 || true
         die "Pick one of the versions above."
       fi
-      $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y "$pkg" ;;
+      apt_install_with_repair "$pkg" ;;
     dnf)
       $SUDO dnf install -y "$pkg" \
         || die "'$pkg' not found. Try: dnf search openjdk" ;;
