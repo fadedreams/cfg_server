@@ -30,3 +30,6 @@ curl -fsSL https://raw.githubusercontent.com/fadedreams/cfg_server/main/php.sh |
 bash <(curl -fsSL https://raw.githubusercontent.com/fadedreams/cfg_server/main/java.sh)
 ```
 
+``` bash
+bash <(curl -fsSL https://raw.githubusercontent.com/fadedreams/cfg_server/main/cpp.sh)
+```
