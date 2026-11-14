@@ -2,6 +2,7 @@
 # Detects the Linux distro and installs Kubernetes tooling:
 #   kubectl, helm, kind, minikube, k3s            (clusters and core CLIs)
 #   k9s, kubectx + kubens, stern                  (day-to-day helpers)
+#   testkube                                      (Testkube CLI: kubectl-testkube, testkube, tk)
 # Supported: Ubuntu, Debian, Fedora, Rocky/Alma/RHEL/CentOS, Arch (and derivatives)
 #
 # Usage:
@@ -10,11 +11,13 @@
 #   sudo ./install-k8s-tools.sh --kubectl --helm --kind
 #   sudo ./install-k8s-tools.sh --k3s
 #   sudo ./install-k8s-tools.sh --k9s --kubectx --stern
+#   sudo ./install-k8s-tools.sh --testkube
 #
 # Pin versions with env vars (use sudo -E):
 #   KUBECTL_VERSION=v1.31.2  HELM_VERSION=v3.16.2  KIND_VERSION=v0.24.0
 #   MINIKUBE_VERSION=v1.34.0 K3S_VERSION=v1.31.2+k3s1
 #   K9S_VERSION=v0.32.7      KUBECTX_VERSION=v0.9.5  STERN_VERSION=v1.31.0
+#   TESTKUBE_VERSION=2.15.0
 #
 # k3s on RHEL-family / Fedora:
 #   - installs container-selinux before the k3s installer
@@ -47,6 +50,7 @@ Usage: install-k8s-tools.sh [options]
   --k9s         install k9s (terminal UI for clusters)
   --kubectx     install kubectx and kubens (switch contexts / namespaces fast)
   --stern       install stern (multi-pod log tailing)
+  --testkube    install the Testkube CLI (testkube / tk)
   -h, --help    show this help
 
 With no options, an interactive menu is shown.
@@ -427,15 +431,82 @@ install_stern() {
   ok "stern $ver installed"
 }
 
+# ---- Testkube ----------------------------------------------------------------
+# Newer Testkube releases are tagged without a "v" prefix (2.15.0), older ones
+# with it (v1.17.53), so both are tried. Some releases (e.g. patch releases) ship
+# no CLI binaries, so the latest release may need to fall back to an earlier one.
+#   $1 = version (no "v"), $2 = tarball name; prints the working tag.
+testkube_find_tag() {
+  local t
+  for t in "$1" "v$1"; do
+    if curl -fsIL -o /dev/null "https://github.com/kubeshop/testkube/releases/download/${t}/$2"; then
+      echo "$t"
+      return 0
+    fi
+  done
+  return 1
+}
+
+install_testkube() {
+  log "Installing Testkube CLI"
+  local ver="${TESTKUBE_VERSION:-}" pinned=0
+  if [[ -n "$ver" ]]; then pinned=1; fi
+  [[ -n "$ver" ]] || ver="$(github_latest kubeshop/testkube)"
+  ver="${ver#v}"
+
+  # Testkube names its x86 builds "x86_64" instead of "amd64".
+  local tkarch
+  case "$ARCH" in amd64) tkarch="x86_64" ;; *) tkarch="$ARCH" ;; esac
+
+  local file="testkube_${ver}_Linux_${tkarch}.tar.gz" tag=""
+  if ! tag="$(testkube_find_tag "$ver" "$file")"; then
+    [[ $pinned -eq 0 ]] || die "No Linux ${tkarch} Testkube CLI binary found for ${ver}."
+    warn "No Linux ${tkarch} CLI binary for Testkube ${ver}; searching recent releases..."
+
+    local v
+    tag=""
+    for v in $(curl -fsSL "https://api.github.com/repos/kubeshop/testkube/releases?per_page=20" \
+               | grep -oE '"tag_name": *"v?[0-9]+\.[0-9]+\.[0-9]+"' | grep -oE '[0-9]+\.[0-9]+\.[0-9]+'); do
+      file="testkube_${v}_Linux_${tkarch}.tar.gz"
+      if tag="$(testkube_find_tag "$v" "$file")"; then
+        ver="$v"
+        break
+      fi
+      tag=""
+    done
+    [[ -n "$tag" ]] || die "Could not find a Testkube release with a Linux ${tkarch} binary."
+  fi
+
+  local base="https://github.com/kubeshop/testkube/releases/download/${tag}"
+  curl -fsSL -o "$TMP/$file" "$base/$file"
+
+  # Verify the checksum when the release publishes a checksums file.
+  if curl -fsSL -o "$TMP/testkube.sums" "$base/checksums.txt" 2>/dev/null; then
+    verify_sums "$file" testkube.sums
+  else
+    warn "No checksums file found for Testkube; skipping verification."
+  fi
+
+  mkdir -p "$TMP/testkube"
+  tar -xzf "$TMP/$file" -C "$TMP/testkube" kubectl-testkube
+  $SUDO install -m 0755 "$TMP/testkube/kubectl-testkube" /usr/local/bin/kubectl-testkube
+  $SUDO ln -sf /usr/local/bin/kubectl-testkube /usr/local/bin/testkube
+  $SUDO ln -sf /usr/local/bin/kubectl-testkube /usr/local/bin/tk
+  TESTKUBE_INSTALLED="$ver"
+  ok "Testkube CLI $ver installed (kubectl-testkube, testkube, tk)"
+  log "Deploy it into a cluster with: testkube init (needs a working kube-context)"
+}
+
 # ---- choose components ------------------------------------------------------
 WANT_KUBECTL=0; WANT_HELM=0; WANT_KIND=0; WANT_MINIKUBE=0; WANT_K3S=0
-WANT_K9S=0; WANT_KUBECTX=0; WANT_STERN=0
+WANT_K9S=0; WANT_KUBECTX=0; WANT_STERN=0; WANT_TESTKUBE=0
+TESTKUBE_INSTALLED=""
 
 if [[ $# -gt 0 ]]; then
   for arg in "$@"; do
     case "$arg" in
       --all)      WANT_KUBECTL=1; WANT_HELM=1; WANT_KIND=1; WANT_MINIKUBE=1; WANT_K3S=1
-                  WANT_K9S=1; WANT_KUBECTX=1; WANT_STERN=1 ;;
+                  WANT_K9S=1; WANT_KUBECTX=1; WANT_STERN=1; WANT_TESTKUBE=1 ;;
       --kubectl)  WANT_KUBECTL=1 ;;
       --helm)     WANT_HELM=1 ;;
       --kind)     WANT_KIND=1 ;;
@@ -444,6 +515,7 @@ if [[ $# -gt 0 ]]; then
       --k9s)      WANT_K9S=1 ;;
       --kubectx)  WANT_KUBECTX=1 ;;
       --stern)    WANT_STERN=1 ;;
+      --testkube) WANT_TESTKUBE=1 ;;
       -h|--help)  usage; exit 0 ;;
       *)          usage; die "Unknown option: $arg" ;;
     esac
@@ -461,6 +533,7 @@ Select components to install:
   6) k9s
   7) kubectx + kubens
   8) stern
+  9) testkube
   a) all
 
 EOF
@@ -475,14 +548,15 @@ EOF
       6) WANT_K9S=1 ;;
       7) WANT_KUBECTX=1 ;;
       8) WANT_STERN=1 ;;
+      9) WANT_TESTKUBE=1 ;;
       a|A) WANT_KUBECTL=1; WANT_HELM=1; WANT_KIND=1; WANT_MINIKUBE=1; WANT_K3S=1
-           WANT_K9S=1; WANT_KUBECTX=1; WANT_STERN=1 ;;
+           WANT_K9S=1; WANT_KUBECTX=1; WANT_STERN=1; WANT_TESTKUBE=1 ;;
       *) die "Invalid choice: $c" ;;
     esac
   done
 fi
 
-TOTAL=$((WANT_KUBECTL + WANT_HELM + WANT_KIND + WANT_MINIKUBE + WANT_K3S + WANT_K9S + WANT_KUBECTX + WANT_STERN))
+TOTAL=$((WANT_KUBECTL + WANT_HELM + WANT_KIND + WANT_MINIKUBE + WANT_K3S + WANT_K9S + WANT_KUBECTX + WANT_STERN + WANT_TESTKUBE))
 [[ $TOTAL -gt 0 ]] || die "Nothing selected."
 
 # ---- run --------------------------------------------------------------------
@@ -495,6 +569,7 @@ install_prereqs
 [[ $WANT_K9S      -eq 1 ]] && install_k9s
 [[ $WANT_KUBECTX  -eq 1 ]] && install_kubectx
 [[ $WANT_STERN    -eq 1 ]] && install_stern
+[[ $WANT_TESTKUBE -eq 1 ]] && install_testkube
 [[ $WANT_K3S      -eq 1 ]] && install_k3s   # last, so it doesn't clobber an existing kubectl
 
 # ---- summary ----------------------------------------------------------------
@@ -507,6 +582,7 @@ command -v minikube >/dev/null 2>&1 && echo "  minikube: $(minikube version --sh
 command -v k9s      >/dev/null 2>&1 && echo "  k9s     : $(k9s version --short 2>/dev/null | awk '/^Version/ {print $2; exit}')"
 command -v kubectx  >/dev/null 2>&1 && echo "  kubectx : $(kubectx --version 2>/dev/null | head -n1) (kubens: $(kubens --version 2>/dev/null | head -n1))"
 command -v stern    >/dev/null 2>&1 && echo "  stern   : $(stern --version 2>/dev/null | awk '/^version:/ {print $2; exit}')"
+command -v testkube >/dev/null 2>&1 && echo "  testkube: ${TESTKUBE_INSTALLED:-installed} (/usr/local/bin/testkube)"
 command -v k3s      >/dev/null 2>&1 && echo "  k3s     : $(k3s --version | head -n1)"
 echo
 ok "Done."
