@@ -41,3 +41,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/fadedreams/cfg_server/main/k
 ``` bash
 bash <(curl -fsSL https://raw.githubusercontent.com/fadedreams/cfg_server/main/vi.sh)
 ```
+
+``` bash
+bash <(curl -fsSL https://raw.githubusercontent.com/fadedreams/cfg_server/main/brew.sh)
+```
