@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Detects the Linux distro, lists the 10 latest Node.js releases from nodejs.org,
-# lets you pick one (or type any version), then installs it.
+# lets you pick one (or type any version), then installs it. Can also install nvm.
 # Supported: Ubuntu, Debian, Fedora, Rocky/Alma/RHEL/CentOS, Arch (and derivatives)
 #
 # Usage:
@@ -8,6 +8,8 @@
 #   sudo ./install-node.sh 22.11.0      # exact version
 #   sudo ./install-node.sh 22           # newest 22.x
 #   sudo ./install-node.sh lts          # newest LTS
+#   sudo ./install-node.sh lts --nvm    # Node.js + latest nvm (for the invoking user)
+#   sudo ./install-node.sh --nvm-only   # only nvm
 #   ./install-node.sh --list            # just show the 10 latest releases
 #
 # Env:
@@ -16,6 +18,11 @@
 
 set -euo pipefail
 
+INSTALL_DIR="${INSTALL_DIR:-/usr/local/lib/nodejs}"
+BIN_DIR="${BIN_DIR:-/usr/local/bin}"
+DIST_URL="https://nodejs.org/dist"
+NVM_FALLBACK_TAG="v0.40.3"
+
 log()  { printf '\033[1;34m[*]\033[0m %s\n' "$*"; }
 ok()   { printf '\033[1;32m[+]\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[!]\033[0m %s\n' "$*"; }
@@ -23,263 +30,270 @@ die()  { printf '\033[1;31m[x]\033[0m %s\n' "$*" >&2; exit 1; }
 
 usage() {
   cat <<'EOF'
-Usage: install-node.sh [VERSION | lts | latest | MAJOR] [--list] [-h]
+Usage: install-node.sh [VERSION | lts | latest | MAJOR] [--nvm] [--nvm-only] [--list] [-h]
 
   (no args)    interactive menu of the 10 latest releases
   22.11.0      install that exact version
   22           install the newest 22.x
   lts          install the newest LTS release
   latest       install the newest release
+  --nvm        also install the latest nvm (for the invoking user, in ~/.nvm)
+  --nvm-only   install only nvm, skip Node.js
   --list       show the 10 latest releases and exit
 
 Env: INSTALL_DIR (default /usr/local/lib/nodejs), BIN_DIR (default /usr/local/bin)
 EOF
 }
 
-INSTALL_DIR="${INSTALL_DIR:-/usr/local/lib/nodejs}"
-BIN_DIR="${BIN_DIR:-/usr/local/bin}"
-DIST_URL="${NODE_DIST_URL:-https://nodejs.org/dist}"
+# ---------------------------------------------------------------- distro ----
 
-REQUESTED=""
-LIST_ONLY=0
-for arg in "$@"; do
-  case "$arg" in
-    -h|--help) usage; exit 0 ;;
-    --list)    LIST_ONLY=1 ;;
-    -*)        usage; die "Unknown option: $arg" ;;
-    *)         REQUESTED="$arg" ;;
+DISTRO_FAMILY=""
+
+detect_distro() {
+  [ -r /etc/os-release ] || die "Cannot read /etc/os-release; unsupported system"
+  # shellcheck disable=SC1091
+  . /etc/os-release
+  local ids=" ${ID:-} ${ID_LIKE:-} "
+  case "$ids" in
+    *" ubuntu "*|*" debian "*)                        DISTRO_FAMILY="debian" ;;
+    *" fedora "*)                                     DISTRO_FAMILY="fedora" ;;
+    *" rhel "*|*" centos "*|*" rocky "*|*" almalinux "*) DISTRO_FAMILY="rhel" ;;
+    *" arch "*)                                       DISTRO_FAMILY="arch" ;;
+    *) die "Unsupported distro: ${PRETTY_NAME:-unknown}" ;;
   esac
-done
+  log "Detected: ${PRETTY_NAME:-$ID} (family: $DISTRO_FAMILY)"
+}
 
-# ---- root / sudo ------------------------------------------------------------
-if [[ $EUID -ne 0 ]]; then
-  if command -v sudo >/dev/null 2>&1; then SUDO="sudo"; else SUDO=""; fi
-else
-  SUDO=""
-fi
+node_arch() {
+  case "$(uname -m)" in
+    x86_64|amd64)   echo "x64" ;;
+    aarch64|arm64)  echo "arm64" ;;
+    armv7l)         echo "armv7l" ;;
+    ppc64le)        echo "ppc64le" ;;
+    s390x)          echo "s390x" ;;
+    *) die "Unsupported CPU architecture: $(uname -m)" ;;
+  esac
+}
 
-# ---- detect distro ----------------------------------------------------------
-[[ -r /etc/os-release ]] || die "/etc/os-release not found; can't detect distro."
-# shellcheck disable=SC1091
-. /etc/os-release
-DISTRO="${ID:-unknown}"
-LIKE="${ID_LIKE:-}"
-
-family=""
-case "$DISTRO" in
-  ubuntu|debian|linuxmint|pop|elementary|zorin|raspbian) family="debian" ;;
-  fedora)                                                family="fedora" ;;
-  rocky|almalinux|rhel|centos|ol)                        family="rhel"   ;;
-  arch|manjaro|endeavouros)                              family="arch"   ;;
-  *)
-    case " $LIKE " in
-      *" ubuntu "*|*" debian "*) family="debian" ;;
-      *" fedora "*)              family="fedora" ;;
-      *" rhel "*|*" centos "*)   family="rhel"   ;;
-      *" arch "*)                family="arch"   ;;
-      *) die "Unsupported distro: $DISTRO (ID_LIKE='$LIKE')" ;;
-    esac
-    ;;
-esac
-
-# ---- detect CPU architecture (Node's naming) --------------------------------
-case "$(uname -m)" in
-  x86_64|amd64)   ARCH="x64"     ;;
-  aarch64|arm64)  ARCH="arm64"   ;;
-  armv7l)         ARCH="armv7l"  ;;
-  ppc64le)        ARCH="ppc64le" ;;
-  s390x)          ARCH="s390x"   ;;
-  *) die "Unsupported CPU architecture for official Node.js builds: $(uname -m)" ;;
-esac
-
-log "Detected: ${PRETTY_NAME:-$DISTRO} (family: $family, arch: $ARCH)"
-
-# ---- prerequisites ----------------------------------------------------------
-install_prereqs() {
-  local missing=()
-  for c in curl tar xz jq sha256sum; do
-    if ! command -v "$c" >/dev/null 2>&1; then missing+=("$c"); fi
+ensure_deps() {
+  local missing=0 c
+  for c in curl tar xz sha256sum; do
+    command -v "$c" >/dev/null 2>&1 || missing=1
   done
-  if [[ ${#missing[@]} -eq 0 ]]; then return 0; fi
+  [ "$missing" -eq 0 ] && return 0
 
-  if [[ -z "$SUDO" && $EUID -ne 0 ]]; then
-    die "Missing tools (${missing[*]}) and no sudo available to install them."
-  fi
-  log "Installing prerequisites: ${missing[*]}"
-  case "$family" in
-    debian)      $SUDO apt-get update -y && $SUDO apt-get install -y curl tar xz-utils jq coreutils ca-certificates ;;
-    fedora|rhel) $SUDO dnf install -y curl tar xz jq coreutils ca-certificates ;;
-    arch)        $SUDO pacman -Sy --noconfirm --needed curl tar xz jq coreutils ca-certificates ;;
+  [ "$(id -u)" -eq 0 ] || die "Missing dependencies (curl, tar, xz). Run with sudo to install them."
+  log "Installing dependencies (curl, tar, xz)..."
+  case "$DISTRO_FAMILY" in
+    debian)
+      apt-get update -y
+      apt-get install -y curl xz-utils tar ca-certificates coreutils ;;
+    fedora)
+      dnf install -y xz tar ca-certificates coreutils
+      command -v curl >/dev/null 2>&1 || dnf install -y curl ;;
+    rhel)
+      # Don't force-install curl: Rocky/Alma ship curl-minimal, which conflicts
+      local pm=dnf
+      command -v dnf >/dev/null 2>&1 || pm=yum
+      "$pm" install -y xz tar ca-certificates coreutils
+      command -v curl >/dev/null 2>&1 || "$pm" install -y curl ;;
+    arch)
+      pacman -S --noconfirm --needed curl xz tar ca-certificates coreutils ;;
   esac
 }
-install_prereqs
 
-# Official Node.js binaries link against libatomic, which minimal server images often lack.
-has_libatomic() {
-  local out
-  out="$(ldconfig -p 2>/dev/null || /sbin/ldconfig -p 2>/dev/null || true)"
-  [[ "$out" == *"libatomic.so.1"* ]]
+# --------------------------------------------------------------- releases ---
+
+RELEASES=""   # lines of: "vX.Y.Z <LTS-codename|false>", newest first
+
+fetch_releases() {
+  local raw
+  raw="$(curl -fsSL "$DIST_URL/index.json")" || die "Could not fetch $DIST_URL/index.json"
+  RELEASES="$(printf '%s' "$raw" \
+    | grep -o '"version":"v[0-9.]*"[^}]*' \
+    | sed -n 's/^"version":"\(v[0-9.]*\)".*"lts":\(false\|"[A-Za-z]*"\).*/\1 \2/p' \
+    | tr -d '"')" || true
+  [ -n "$RELEASES" ] || die "Could not parse the release list"
 }
-install_runtime_libs() {
-  if has_libatomic; then return 0; fi
-  log "Installing libatomic (required by Node.js)"
-  case "$family" in
-    debian) $SUDO apt-get update -y && $SUDO apt-get install -y libatomic1 ;;
-    fedora|rhel) $SUDO dnf install -y libatomic ;;
-    arch)   $SUDO pacman -Sy --noconfirm --needed gcc-libs ;;
-  esac
+
+print_latest() {
+  local i=1 ver lts tag
+  printf '\nLatest 10 Node.js releases:\n'
+  while read -r ver lts; do
+    tag=""
+    [ "$lts" != "false" ] && tag="  (LTS: $lts)"
+    printf '  %2d) %s%s\n' "$i" "$ver" "$tag"
+    i=$((i + 1))
+  done < <(printf '%s\n' "$RELEASES" | head -n 10)
+  printf '\n'
 }
-install_runtime_libs
 
-# ---- fetch release list -----------------------------------------------------
-log "Fetching Node.js releases from nodejs.org"
-JSON="$(curl -fsSL "$DIST_URL/index.json")" || die "Could not fetch $DIST_URL/index.json"
-
-# Only releases that have a build for this architecture. Newest first.
-# Each line: version|lts-codename-or-empty
-mapfile -t LINES < <(jq -r --arg a "$ARCH" '
-  [.[] | select(.files | index("linux-" + $a))] | .[0:10] | .[]
-  | .version + "|" + (if .lts == false then "" else .lts end)' <<<"$JSON")
-[[ ${#LINES[@]} -gt 0 ]] || die "Could not parse the release list."
-
-VERSIONS=(); LTS_NAMES=()
-for line in "${LINES[@]}"; do
-  VERSIONS+=("${line%%|*}")
-  LTS_NAMES+=("${line#*|}")
-done
-
-# Resolve user input to a full version present in the release list.
-# Accepts: lts | latest | 22 | 22.11 | 22.11.0 | v22.11.0
+# Turns lts | latest | MAJOR | MAJOR.MINOR | X.Y.Z | vX.Y.Z into an exact vX.Y.Z
 resolve_version() {
-  local input="${1#v}" lower
-  lower="${input,,}"
-  case "$lower" in
+  local spec="${1#v}" out=""
+  case "$spec" in
     lts)
-      jq -r --arg a "$ARCH" '[.[] | select(.lts != false) | select(.files | index("linux-" + $a))] | .[0].version // empty' <<<"$JSON" ;;
-    latest|current)
-      jq -r --arg a "$ARCH" '[.[] | select(.files | index("linux-" + $a))] | .[0].version // empty' <<<"$JSON" ;;
+      out="$(printf '%s\n' "$RELEASES" | awk '$2!="false"{print $1; exit}')" ;;
+    latest)
+      out="$(printf '%s\n' "$RELEASES" | awk 'NR==1{print $1}')" ;;
     *)
-      if [[ "$input" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
-        jq -r --arg a "$ARCH" --arg p "v${input}." \
-          '[.[] | select(.version | startswith($p)) | select(.files | index("linux-" + $a))] | .[0].version // empty' <<<"$JSON"
+      if [[ "$spec" =~ ^[0-9]+$ ]] || [[ "$spec" =~ ^[0-9]+\.[0-9]+$ ]]; then
+        out="$(printf '%s\n' "$RELEASES" | awk -v p="v$spec." 'index($1,p)==1{print $1; exit}')"
+      elif [[ "$spec" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        out="$(printf '%s\n' "$RELEASES" | awk -v v="v$spec" '$1==v{print $1; exit}')"
       else
-        jq -r --arg a "$ARCH" --arg v "v${input}" \
-          '[.[] | select(.version == $v) | select(.files | index("linux-" + $a))] | .[0].version // empty' <<<"$JSON"
+        die "Invalid version spec: '$1'"
       fi ;;
   esac
+  [ -n "$out" ] || die "No Node.js release matches '$1'"
+  printf '%s' "$out"
 }
 
-LTS_VERSION="$(resolve_version lts)"
-
-# Currently installed version (if any)
-CURRENT=""
-if command -v node >/dev/null 2>&1; then
-  CURRENT="$(node --version 2>/dev/null)" || true
-fi
-
-print_list() {
-  echo
-  echo "10 latest Node.js releases:"
-  local i=1 v tag
-  for v in "${VERSIONS[@]}"; do
-    tag=""
-    if [[ -n "${LTS_NAMES[$((i - 1))]}" ]]; then tag=" (LTS: ${LTS_NAMES[$((i - 1))]})"; fi
-    if [[ -n "$CURRENT" && "$v" == "$CURRENT" ]]; then tag="$tag (installed)"; fi
-    printf '  %2d) %s%s\n' "$i" "${v#v}" "$tag"
-    i=$((i + 1))
-  done
-  echo
-  if [[ -n "$LTS_VERSION" ]]; then echo "Newest LTS: ${LTS_VERSION#v}"; fi
-  if [[ -n "$CURRENT" ]]; then echo "Currently installed: ${CURRENT#v}"; fi
-  echo
-  return 0
+choose_version_interactive() {
+  local ans lts_default
+  print_latest >&2
+  lts_default="$(resolve_version lts)"
+  read -r -p "Pick 1-10, type a version (22, 22.11.0, lts, latest), or Enter for LTS [$lts_default]: " ans
+  ans="${ans//[[:space:]]/}"
+  if [ -z "$ans" ]; then
+    printf '%s' "$lts_default"
+  elif [[ "$ans" =~ ^([1-9]|10)$ ]]; then
+    printf '%s\n' "$RELEASES" | awk -v n="$ans" 'NR==n{print $1}'
+  else
+    resolve_version "$ans"
+  fi
 }
 
-if [[ $LIST_ONLY -eq 1 ]]; then
-  print_list
-  exit 0
-fi
+# ---------------------------------------------------------------- install ---
 
-# ---- choose version ---------------------------------------------------------
-CHOSEN=""
-if [[ -n "$REQUESTED" ]]; then
-  CHOSEN="$(resolve_version "$REQUESTED")"
-  [[ -n "$CHOSEN" ]] || die "No Node.js build found for '$REQUESTED' on linux-$ARCH."
-else
-  [[ -t 0 ]] || die "No version given and no terminal for the menu. Pass one: ./install-node.sh lts"
-  print_list
-  while [[ -z "$CHOSEN" ]]; do
-    read -rp "Pick 1-${#VERSIONS[@]}, 'lts', 'latest', a major (e.g. v22) or a version (e.g. 22.11.0), q to quit [lts]: " answer
-    answer="${answer:-lts}"
-    if [[ "$answer" == "q" || "$answer" == "Q" ]]; then
-      log "Cancelled."; exit 0
-    elif [[ "$answer" =~ ^[0-9]+$ ]] && (( answer >= 1 && answer <= ${#VERSIONS[@]} )); then
-      CHOSEN="${VERSIONS[$((answer - 1))]}"
-    else
-      CHOSEN="$(resolve_version "$answer")"
-      if [[ -z "$CHOSEN" ]]; then warn "No Node.js build found for '$answer'. Try again."; fi
+install_node() {
+  local ver="$1" arch name tarball tmp dest
+  arch="$(node_arch)"
+  name="node-${ver}-linux-${arch}"
+  tarball="${name}.tar.xz"
+  dest="$INSTALL_DIR/$name"
+
+  [ "$(id -u)" -eq 0 ] || die "Installing Node.js needs root. Re-run with sudo."
+
+  if [ -x "$dest/bin/node" ]; then
+    warn "$name already present in $INSTALL_DIR; skipping download"
+  else
+    tmp="$(mktemp -d)"
+    # shellcheck disable=SC2064
+    trap "rm -rf '$tmp'" EXIT
+
+    log "Downloading $tarball ..."
+    curl -fSL --progress-bar -o "$tmp/$tarball" "$DIST_URL/$ver/$tarball"
+    curl -fsSL -o "$tmp/SHASUMS256.txt" "$DIST_URL/$ver/SHASUMS256.txt"
+
+    log "Verifying checksum..."
+    ( cd "$tmp" && grep " $tarball\$" SHASUMS256.txt | sha256sum -c - >/dev/null ) \
+      || die "Checksum verification failed for $tarball"
+    ok "Checksum OK"
+
+    mkdir -p "$INSTALL_DIR"
+    log "Extracting to $INSTALL_DIR ..."
+    tar -xJf "$tmp/$tarball" -C "$INSTALL_DIR"
+  fi
+
+  mkdir -p "$BIN_DIR"
+  local b
+  for b in node npm npx corepack; do
+    if [ -e "$dest/bin/$b" ]; then
+      ln -sfn "$dest/bin/$b" "$BIN_DIR/$b"
     fi
   done
-fi
 
-if [[ "$CHOSEN" == "$CURRENT" ]]; then
-  warn "${CHOSEN#v} is already the active version; reinstalling."
-fi
-log "Selected: ${CHOSEN#v}"
+  ok "Node.js $ver installed -> $dest"
+  "$BIN_DIR/node" --version | sed 's/^/    node /'
+  "$BIN_DIR/npm"  --version | sed 's/^/    npm  /'
+}
 
-# ---- download + verify ------------------------------------------------------
-NAME="node-${CHOSEN}-linux-${ARCH}"
-TARBALL="${NAME}.tar.xz"
-TMP="$(mktemp -d)"
-trap 'rm -rf "$TMP"' EXIT
+# -------------------------------------------------------------------- nvm ---
 
-log "Downloading $TARBALL"
-curl -fSL --progress-bar -o "$TMP/$TARBALL" "$DIST_URL/$CHOSEN/$TARBALL"
-curl -fsSL -o "$TMP/SHASUMS256.txt" "$DIST_URL/$CHOSEN/SHASUMS256.txt"
+# Installs the latest nvm for the real user (not root) into ~/.nvm
+install_nvm() {
+  local target_user target_home tag
+  target_user="${SUDO_USER:-$(id -un)}"
+  target_home="$(getent passwd "$target_user" | cut -d: -f6)"
+  [ -n "$target_home" ] || die "Cannot find home directory for $target_user"
 
-log "Verifying SHA256 checksum"
-( cd "$TMP" && grep " ${TARBALL}\$" SHASUMS256.txt | sha256sum -c - >/dev/null ) \
-  || die "Checksum verification failed."
-ok "Checksum OK"
+  command -v curl >/dev/null 2>&1 || die "curl is required to install nvm"
+  command -v git  >/dev/null 2>&1 || warn "git not found; nvm's installer will fall back to curl/wget"
 
-# ---- install ----------------------------------------------------------------
-[[ -n "$INSTALL_DIR" && "$INSTALL_DIR" != "/" ]] || die "Refusing to use INSTALL_DIR='$INSTALL_DIR'."
-log "Installing to $INSTALL_DIR/$NAME"
-$SUDO mkdir -p "$INSTALL_DIR" "$BIN_DIR"
-$SUDO rm -rf "${INSTALL_DIR:?}/$NAME"
-$SUDO tar -xJf "$TMP/$TARBALL" -C "$INSTALL_DIR"
-
-# 'current' points at the active version, so switching or rolling back is one symlink.
-$SUDO ln -sfn "$INSTALL_DIR/$NAME" "$INSTALL_DIR/current"
-for bin in node npm npx corepack; do
-  if [[ -e "$INSTALL_DIR/current/bin/$bin" ]]; then
-    $SUDO ln -sfn "$INSTALL_DIR/current/bin/$bin" "$BIN_DIR/$bin"
+  # Resolve the latest release tag by following GitHub's /releases/latest redirect
+  tag="$(curl -fsSLI -o /dev/null -w '%{url_effective}' \
+        https://github.com/nvm-sh/nvm/releases/latest | sed 's|.*/||')" || tag=""
+  if ! [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    tag="$NVM_FALLBACK_TAG"
+    warn "Could not resolve latest nvm tag, falling back to $tag"
   fi
-done
+  log "Installing nvm $tag for user '$target_user' in $target_home/.nvm"
 
-# PATH for login shells (also covers globally installed npm binaries)
-PROFILE_FILE="/etc/profile.d/nodejs.sh"
-if [[ -d /etc/profile.d ]]; then
-  $SUDO tee "$PROFILE_FILE" >/dev/null <<EOF
-# Added by install-node.sh
-export PATH="\$PATH:$INSTALL_DIR/current/bin"
-EOF
-  $SUDO chmod 0644 "$PROFILE_FILE"
-fi
+  local run=(bash)
+  if [ "$(id -u)" -eq 0 ] && [ "$target_user" != "root" ]; then
+    run=(sudo -u "$target_user" -H bash)
+  fi
 
-# ---- verify -----------------------------------------------------------------
-if ! NODE_OUT="$("$INSTALL_DIR/current/bin/node" --version 2>&1)"; then
-  die "Install finished but the node binary doesn't run: $NODE_OUT"
-fi
-ok "node $NODE_OUT"
-if [[ -e "$INSTALL_DIR/current/bin/npm" ]]; then
-  ok "npm  $("$INSTALL_DIR/current/bin/node" "$INSTALL_DIR/current/lib/node_modules/npm/bin/npm-cli.js" --version)"
-fi
+  # PROFILE is set explicitly so the installer edits the right rc file under sudo
+  curl -fsSL "https://raw.githubusercontent.com/nvm-sh/nvm/${tag}/install.sh" \
+    | PROFILE="$target_home/.bashrc" NVM_DIR="$target_home/.nvm" "${run[@]}"
 
-if [[ -x /usr/bin/node && "$BIN_DIR" != "/usr/bin" ]]; then
-  warn "A distro-packaged node exists at /usr/bin/node; $BIN_DIR comes first in PATH, so the new one wins."
-fi
+  ok "nvm $tag installed. Open a new shell or run: source ~/.bashrc"
+}
 
-echo
-log "Other installed versions (if any) stay in $INSTALL_DIR and can be deleted safely."
-log "Open a new shell or run 'source $PROFILE_FILE', then check: node -v && npm -v"
+# ------------------------------------------------------------------- main ---
+
+main() {
+  local WITH_NVM=0 NVM_ONLY=0 LIST_ONLY=0 SPEC="" a
+  for a in "$@"; do
+    case "$a" in
+      --nvm)      WITH_NVM=1 ;;
+      --nvm-only) NVM_ONLY=1 ;;
+      --list)     LIST_ONLY=1 ;;
+      -h|--help)  usage; exit 0 ;;
+      -*)         usage >&2; die "Unknown option: $a" ;;
+      *)          [ -z "$SPEC" ] || die "Only one version argument is allowed"
+                  SPEC="$a" ;;
+    esac
+  done
+
+  detect_distro
+
+  if [ "$NVM_ONLY" -eq 1 ]; then
+    ensure_deps
+    install_nvm
+    exit 0
+  fi
+
+  ensure_deps
+  fetch_releases
+
+  if [ "$LIST_ONLY" -eq 1 ]; then
+    print_latest
+    exit 0
+  fi
+
+  local ver
+  if [ -n "$SPEC" ]; then
+    ver="$(resolve_version "$SPEC")"
+  else
+    [ -t 0 ] || die "No version given and stdin is not a terminal. Pass a version, e.g. 'lts'."
+    ver="$(choose_version_interactive)"
+
+    if [ "$WITH_NVM" -eq 0 ]; then
+      local yn
+      read -r -p "Also install nvm? [y/N]: " yn
+      case "$yn" in [yY]*) WITH_NVM=1 ;; esac
+    fi
+  fi
+
+  log "Selected Node.js $ver"
+  install_node "$ver"
+
+  if [ "$WITH_NVM" -eq 1 ]; then
+    install_nvm
+  fi
+}
+
+main "$@"
