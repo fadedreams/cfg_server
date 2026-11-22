@@ -55,10 +55,6 @@ Vi
 bash <(curl -fsSL "https://raw.githubusercontent.com/fadedreams/cfg_server/main/vi.sh?$(date +%s)")
 ```
 
-Homebrew
-``` bash
-bash <(curl -fsSL "https://raw.githubusercontent.com/fadedreams/cfg_server/main/brew.sh?$(date +%s)")
-```
 
 ``` bash
 bash <(curl -fsSL https://raw.githubusercontent.com/fadedreams/cfg_server/main/brew.sh)
