@@ -249,18 +249,16 @@ install_nvm() {
     warn "Could not query the latest nvm release; using $NVM_FALLBACK_TAG"
     tag="$NVM_FALLBACK_TAG"
   fi
-  cmd="set -o pipefail; curl -fsSL https://raw.githubusercontent.com/nvm-sh/nvm/$tag/install.sh | bash"
+  # nvm's installer aborts if $NVM_DIR is set but missing, so create it inside
+  # the same shell/user that runs the installer (works with and without sudo).
+  cmd='if [ -n "${NVM_DIR:-}" ]; then mkdir -p "$NVM_DIR" || { echo "Cannot create NVM_DIR: $NVM_DIR" >&2; exit 1; }; fi; '
+  cmd+="set -o pipefail; curl -fsSL https://raw.githubusercontent.com/nvm-sh/nvm/$tag/install.sh | bash"
 
   if [ "$(id -u)" -eq 0 ] && [ -n "${SUDO_USER:-}" ] && [ "$SUDO_USER" != "root" ]; then
     log "Installing nvm $tag for user $SUDO_USER ..."
     sudo -u "$SUDO_USER" -H bash -c "$cmd"
   else
     if [ "$(id -u)" -eq 0 ]; then warn "Installing nvm for root (no invoking user detected)."; fi
-    # nvm's installer aborts if $NVM_DIR is set but the directory does not exist.
-    if [ -n "${NVM_DIR:-}" ] && [ ! -d "$NVM_DIR" ]; then
-      log "Creating NVM_DIR: $NVM_DIR"
-      mkdir -p "$NVM_DIR" || die "Cannot create NVM_DIR ($NVM_DIR)"
-    fi
     log "Installing nvm $tag ..."
     bash -c "$cmd"
   fi
