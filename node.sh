@@ -256,6 +256,11 @@ install_nvm() {
     sudo -u "$SUDO_USER" -H bash -c "$cmd"
   else
     if [ "$(id -u)" -eq 0 ]; then warn "Installing nvm for root (no invoking user detected)."; fi
+    # nvm's installer aborts if $NVM_DIR is set but the directory does not exist.
+    if [ -n "${NVM_DIR:-}" ] && [ ! -d "$NVM_DIR" ]; then
+      log "Creating NVM_DIR: $NVM_DIR"
+      mkdir -p "$NVM_DIR" || die "Cannot create NVM_DIR ($NVM_DIR)"
+    fi
     log "Installing nvm $tag ..."
     bash -c "$cmd"
   fi
