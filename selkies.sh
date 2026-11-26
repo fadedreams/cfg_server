@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
 # =============================================================================
 # Selkies remote desktop setup (Ubuntu/Debian, run as root)
-# Usage:  bash selkies.sh [SERVER_IP]     (IP optional; falls back to DEFAULT_SERVER_IP)
-# Result: https://<SERVER_IP>:8080  (login with the user/password below)
+# Usage:  bash selkies.sh [SERVER_IP[:PORT]]
+#         e.g.  bash selkies.sh 7.7.7.7
+#               bash selkies.sh 7.7.7.7:8089
+# (IP optional; falls back to DEFAULT_SERVER_IP. Port optional; falls back to DEFAULT_PORT)
+# Result: https://<SERVER_IP>:<PORT>  (login with the user/password below)
 # Includes: XFCE, terminal, Firefox, openssl, systemd services, DARK THEME,
 #           crisp SVG icons (Papirus-Dark) + sane icon sizes in Thunar
 # =============================================================================
@@ -10,10 +13,9 @@ set -euo pipefail
 
 # ----------------------------- CONFIG (edit me) ------------------------------
 SELKIES_URL="https://github.com/selkies-project/selkies/releases/download/9232d04/selkies-0.0.0.dev0-x86_64-linux-gnu.tar.gz"
-# Server IP: pass as the first argument, otherwise this default is used.
+# Server IP / port: pass as the first argument (IP or IP:PORT), otherwise defaults are used.
 DEFAULT_SERVER_IP="185.179.152.192"
-SERVER_IP="${1:-$DEFAULT_SERVER_IP}"
-PORT="8080"
+DEFAULT_PORT="8080"
 AUTH_USER="admin"
 AUTH_PASS="admin"
 RESOLUTION="1920x1080x24"
@@ -34,13 +36,30 @@ if [[ $EUID -ne 0 ]]; then
   exit 1
 fi
 
+# Parse "IP" or "IP:PORT" from the first argument
+ARG="${1:-$DEFAULT_SERVER_IP}"
+if [[ "$ARG" == *:* ]]; then
+  SERVER_IP="${ARG%%:*}"
+  PORT="${ARG##*:}"
+else
+  SERVER_IP="$ARG"
+  PORT="$DEFAULT_PORT"
+fi
+
 # Basic IPv4 sanity check (the IP goes into the TLS certificate)
 if ! [[ "$SERVER_IP" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
   echo "Invalid server IP: '$SERVER_IP'" >&2
-  echo "Usage: bash selkies.sh [SERVER_IP]" >&2
+  echo "Usage: bash selkies.sh [SERVER_IP[:PORT]]" >&2
   exit 1
 fi
-echo "==> Using server IP: $SERVER_IP"
+
+# Port sanity check (1-65535)
+if ! [[ "$PORT" =~ ^[0-9]+$ ]] || (( PORT < 1 || PORT > 65535 )); then
+  echo "Invalid port: '$PORT' (must be 1-65535)" >&2
+  echo "Usage: bash selkies.sh [SERVER_IP[:PORT]]" >&2
+  exit 1
+fi
+echo "==> Using server: $SERVER_IP  port: $PORT"
 
 export DEBIAN_FRONTEND=noninteractive
 

@@ -35,5 +35,5 @@ bash <(curl -fsSL "https://raw.githubusercontent.com/fadedreams/cfg_server/main/
 bash <(curl -fsSL https://raw.githubusercontent.com/fadedreams/cfg_server/main/brew.sh)
 ```
 ``` bash
-bash <(curl -fsSL "https://raw.githubusercontent.com/fadedreams/cfg_server/main/selkies.sh?$(date +%s)") 7.7.7.7
+bash <(curl -fsSL "https://raw.githubusercontent.com/fadedreams/cfg_server/main/selkies.sh?$(date +%s)") 7.7.7.7:8088
 ```
