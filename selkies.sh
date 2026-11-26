@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
 # =============================================================================
 # Selkies remote desktop setup (Ubuntu/Debian, run as root)
-# Usage:  bash selkies.sh [SERVER_IP[:PORT]]
-#         e.g.  bash selkies.sh 7.7.7.7
-#               bash selkies.sh 7.7.7.7:8089
-# (IP optional; falls back to DEFAULT_SERVER_IP. Port optional; falls back to DEFAULT_PORT)
+# Usage:  bash selkies.sh [[SERVER_IP]:PORT]
+#         bash selkies.sh                 -> auto-detected public IP, default port
+#         bash selkies.sh :8088           -> auto-detected public IP, port 8088
+#         bash selkies.sh 8088            -> same as :8088
+#         bash selkies.sh 7.7.7.7         -> your IP, default port
+#         bash selkies.sh 7.7.7.7:8088    -> your IP, your port
+# If no IP is given, the public IPv4 is auto-detected (falls back to DEFAULT_SERVER_IP).
 # Result: https://<SERVER_IP>:<PORT>  (login with the user/password below)
 # Includes: XFCE, terminal, Epiphany (GNOME Web), openssl, systemd services,
 #           DARK THEME, crisp SVG icons (Papirus-Dark) + sane icon sizes in Thunar
@@ -13,7 +16,7 @@ set -euo pipefail
 
 # ----------------------------- CONFIG (edit me) ------------------------------
 SELKIES_URL="https://github.com/selkies-project/selkies/releases/download/9232d04/selkies-0.0.0.dev0-x86_64-linux-gnu.tar.gz"
-# Server IP / port: pass as the first argument (IP or IP:PORT), otherwise defaults are used.
+# Fallbacks used only when nothing is passed / auto-detect fails.
 DEFAULT_SERVER_IP="185.179.152.192"
 DEFAULT_PORT="8080"
 AUTH_USER="admin"
@@ -36,27 +39,50 @@ if [[ $EUID -ne 0 ]]; then
   exit 1
 fi
 
-# Parse "IP" or "IP:PORT" from the first argument
-ARG="${1:-$DEFAULT_SERVER_IP}"
+# Parse the first argument: "", "IP", "IP:PORT", ":PORT" or "PORT"
+ARG="${1:-}"
+SERVER_IP=""
+PORT="$DEFAULT_PORT"
 if [[ "$ARG" == *:* ]]; then
   SERVER_IP="${ARG%%:*}"
   PORT="${ARG##*:}"
-else
+elif [[ "$ARG" =~ ^[0-9]+$ ]]; then
+  PORT="$ARG"                 # digits only = a port, not an IP
+elif [[ -n "$ARG" ]]; then
   SERVER_IP="$ARG"
-  PORT="$DEFAULT_PORT"
+fi
+[[ -z "$PORT" ]] && PORT="$DEFAULT_PORT"
+
+# No IP given -> auto-detect public IPv4
+if [[ -z "$SERVER_IP" ]]; then
+  DETECTED=""
+  for url in ifconfig.me api.ipify.org icanhazip.com; do
+    DETECTED="$(curl -4 -fsS --max-time 8 "$url" 2>/dev/null | tr -d '[:space:]' || true)"
+    if [[ "$DETECTED" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+      break
+    fi
+    DETECTED=""
+  done
+  if [[ -n "$DETECTED" ]]; then
+    SERVER_IP="$DETECTED"
+    echo "==> Auto-detected public IP: $SERVER_IP"
+  else
+    SERVER_IP="$DEFAULT_SERVER_IP"
+    echo "==> Could not auto-detect public IP, using default: $SERVER_IP"
+  fi
 fi
 
 # Basic IPv4 sanity check (the IP goes into the TLS certificate)
 if ! [[ "$SERVER_IP" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
   echo "Invalid server IP: '$SERVER_IP'" >&2
-  echo "Usage: bash selkies.sh [SERVER_IP[:PORT]]" >&2
+  echo "Usage: bash selkies.sh [[SERVER_IP]:PORT]" >&2
   exit 1
 fi
 
 # Port sanity check (1-65535)
 if ! [[ "$PORT" =~ ^[0-9]+$ ]] || (( PORT < 1 || PORT > 65535 )); then
   echo "Invalid port: '$PORT' (must be 1-65535)" >&2
-  echo "Usage: bash selkies.sh [SERVER_IP[:PORT]]" >&2
+  echo "Usage: bash selkies.sh [[SERVER_IP]:PORT]" >&2
   exit 1
 fi
 echo "==> Using server: $SERVER_IP  port: $PORT"
