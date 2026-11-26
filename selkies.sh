@@ -18,7 +18,7 @@
 #         bash selkies.sh 7.7.7.7:8088    -> your IP, your port
 # If no IP is given, the public IPv4 is auto-detected (falls back to DEFAULT_SERVER_IP).
 # Result: https://<SERVER_IP>:<PORT>  (login with the user/password below)
-# Includes: XFCE, terminal, Firefox (dark UI + dark web pages), openssl,
+# Includes: XFCE, terminal, Firefox as DEFAULT browser (dark UI + dark pages), openssl,
 #           systemd services, DARK THEME, crisp SVG icons (Papirus-Dark)
 #           + sane icon sizes in Thunar
 # =============================================================================
@@ -106,14 +106,17 @@ pm_try() {       # soft install: one package at a time, never aborts
     pm_install "$p" >/dev/null 2>&1 && echo "    installed: $p" || echo "    skipped (not available): $p"
   done
 }
-pm_remove() {
-  case "$PM" in
-    apt)    apt-get purge -y "$@" ;;
-    dnf)    dnf remove -y "$@" ;;
-    yum)    yum remove -y "$@" ;;
-    pacman) pacman -Rns --noconfirm "$@" ;;
-    zypper) zypper --non-interactive remove "$@" ;;
-  esac
+pm_remove() {    # one package at a time so an unknown/uninstalled name can't abort the rest
+  local p
+  for p in "$@"; do
+    case "$PM" in
+      apt)    dpkg -s "$p" >/dev/null 2>&1 && apt-get purge -y "$p" ;;
+      dnf)    rpm -q "$p" >/dev/null 2>&1 && dnf remove -y "$p" ;;
+      yum)    rpm -q "$p" >/dev/null 2>&1 && yum remove -y "$p" ;;
+      pacman) pacman -Qi "$p" >/dev/null 2>&1 && pacman -Rns --noconfirm "$p" ;;
+      zypper) rpm -q "$p" >/dev/null 2>&1 && zypper --non-interactive remove "$p" ;;
+    esac || true
+  done
 }
 fetch() {        # fetch URL OUTPUT  (curl or wget, whichever exists)
   if command -v curl >/dev/null 2>&1; then curl -fsSL "$1" -o "$2"
@@ -237,8 +240,10 @@ PULSE_BIN="$(command -v pulseaudio || true)"
 [[ -n "$PULSE_BIN" ]] || echo "    NOTE: pulseaudio not installed - the desktop will have no audio."
 
 echo "==> [2/9] Installing Firefox"
-# Remove browsers installed by previous runs of this script
-pm_remove falkon qt5-gtk-platformtheme epiphany-browser >/dev/null 2>&1 || true
+# Falkon is NOT installed by this script anymore. If an earlier run installed it
+# (or Epiphany), uninstall it and wipe its leftovers so Firefox is the only browser.
+pm_remove falkon qt5-gtk-platformtheme epiphany-browser epiphany >/dev/null 2>&1 || true
+rm -rf /root/.config/falkon /root/.local/share/falkon /root/.cache/falkon 2>/dev/null || true
 
 FIREFOX_BIN=""
 case "$PM" in
@@ -272,17 +277,59 @@ if [[ -z "$FIREFOX_BIN" ]]; then
   echo "             install a browser manually afterwards."
 fi
 
-echo "==> [3/9] Setting default terminal and browser for XFCE"
-if command -v update-alternatives >/dev/null 2>&1; then   # Debian family only
-  update-alternatives --set x-terminal-emulator /usr/bin/xfce4-terminal.wrapper 2>/dev/null || true
-  if [[ -n "$FIREFOX_BIN" ]]; then
-    update-alternatives --install /usr/bin/x-www-browser x-www-browser "$FIREFOX_BIN" 200 2>/dev/null || true
-    update-alternatives --set x-www-browser "$FIREFOX_BIN" 2>/dev/null || true
+echo "==> [3/9] Setting default terminal and browser (Firefox) for XFCE"
+if [[ -n "$FIREFOX_BIN" ]]; then
+  # Debian's firefox-esr has no plain "firefox" command; XFCE's helper expects one
+  if [[ "$(basename "$FIREFOX_BIN")" == "firefox-esr" && ! -e /usr/local/bin/firefox ]]; then
+    ln -s "$FIREFOX_BIN" /usr/local/bin/firefox
   fi
+  # Find Firefox's .desktop file name
+  FIREFOX_DESKTOP=""
+  for d in firefox.desktop firefox-esr.desktop org.mozilla.firefox.desktop; do
+    if [[ -f "/usr/share/applications/$d" ]]; then FIREFOX_DESKTOP="$d"; break; fi
+  done
+  [[ -n "$FIREFOX_DESKTOP" ]] || FIREFOX_DESKTOP="firefox.desktop"
+
+  # (a) Debian-family alternatives
+  if command -v update-alternatives >/dev/null 2>&1; then
+    for alt in x-www-browser gnome-www-browser; do
+      update-alternatives --install /usr/bin/$alt $alt "$FIREFOX_BIN" 200 2>/dev/null || true
+      update-alternatives --set $alt "$FIREFOX_BIN" 2>/dev/null || true
+    done
+  fi
+  # (b) XDG default applications (what links/open-with use on every distro)
+  mkdir -p /root/.config
+  cat > /root/.config/mimeapps.list <<EOF
+[Default Applications]
+x-scheme-handler/http=$FIREFOX_DESKTOP
+x-scheme-handler/https=$FIREFOX_DESKTOP
+x-scheme-handler/about=$FIREFOX_DESKTOP
+x-scheme-handler/unknown=$FIREFOX_DESKTOP
+text/html=$FIREFOX_DESKTOP
+application/xhtml+xml=$FIREFOX_DESKTOP
+application/x-extension-htm=$FIREFOX_DESKTOP
+application/x-extension-html=$FIREFOX_DESKTOP
+application/x-extension-xhtml=$FIREFOX_DESKTOP
+
+[Added Associations]
+x-scheme-handler/http=$FIREFOX_DESKTOP;
+x-scheme-handler/https=$FIREFOX_DESKTOP;
+text/html=$FIREFOX_DESKTOP;
+EOF
+  if command -v xdg-settings >/dev/null 2>&1; then
+    HOME=/root xdg-settings set default-web-browser "$FIREFOX_DESKTOP" 2>/dev/null || true
+  fi
+  if command -v xdg-mime >/dev/null 2>&1; then
+    HOME=/root xdg-mime default "$FIREFOX_DESKTOP" x-scheme-handler/http x-scheme-handler/https text/html 2>/dev/null || true
+  fi
+fi
+if command -v update-alternatives >/dev/null 2>&1; then
+  update-alternatives --set x-terminal-emulator /usr/bin/xfce4-terminal.wrapper 2>/dev/null || true
 fi
 # Stop a running desktop first so it doesn't overwrite the config files we write
 systemctl stop selkies-desktop 2>/dev/null || true
 mkdir -p /root/.config/xfce4
+# (c) XFCE's own "Preferred Applications" (panel launcher, Thunar, exo-open)
 cat > /root/.config/xfce4/helpers.rc <<'EOF'
 TerminalEmulator=xfce4-terminal
 WebBrowser=firefox
