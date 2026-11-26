@@ -9,8 +9,9 @@
 #         bash selkies.sh 7.7.7.7:8088    -> your IP, your port
 # If no IP is given, the public IPv4 is auto-detected (falls back to DEFAULT_SERVER_IP).
 # Result: https://<SERVER_IP>:<PORT>  (login with the user/password below)
-# Includes: XFCE, terminal, Epiphany (GNOME Web), openssl, systemd services,
-#           DARK THEME, crisp SVG icons (Papirus-Dark) + sane icon sizes in Thunar
+# Includes: XFCE, terminal, Falkon (dark UI + dark web pages), openssl,
+#           systemd services, DARK THEME, crisp SVG icons (Papirus-Dark)
+#           + sane icon sizes in Thunar
 # =============================================================================
 set -euo pipefail
 
@@ -29,6 +30,9 @@ CERT_DIR="/etc/selkies"
 # Dark theme (Arc-Dark is preferred; falls back to Adwaita-dark if unavailable)
 GTK_THEME_NAME="Arc-Dark"
 ICON_THEME_NAME="Papirus-Dark"
+
+# Force dark mode on web pages in Falkon (1 = on, 0 = only the browser UI is dark)
+FALKON_DARK_PAGES="1"
 
 # Thunar icon size. Options: 38, 50, 75, 100, 150  (percent; 75 = ~48px, 100 = ~64px)
 THUNAR_ZOOM="75"
@@ -104,20 +108,27 @@ apt-get install -y \
 apt-get install -y arc-theme || echo "    arc-theme not available, will fall back"
 apt-get install -y papirus-icon-theme || echo "    papirus-icon-theme not available, will fall back"
 
-echo "==> [2/9] Installing Epiphany (GNOME Web, lightweight browser)"
-apt-get install -y epiphany-browser
+echo "==> [2/9] Installing Falkon (lightweight Qt browser) + Qt->GTK theme bridge"
+# Remove Epiphany if a previous run installed it
+apt-get purge -y epiphany-browser 2>/dev/null || true
+apt-get autoremove -y 2>/dev/null || true
+apt-get install -y falkon
+# Makes Qt apps (Falkon) follow the GTK dark theme. Optional: don't abort if missing.
+apt-get install -y qt5-gtk-platformtheme || echo "    qt5-gtk-platformtheme not available, Falkon UI may stay light"
 
 echo "==> [3/9] Setting default terminal and browser for XFCE"
 update-alternatives --set x-terminal-emulator /usr/bin/xfce4-terminal.wrapper 2>/dev/null || true
+update-alternatives --install /usr/bin/x-www-browser x-www-browser /usr/bin/falkon 200 2>/dev/null || true
+update-alternatives --set x-www-browser /usr/bin/falkon 2>/dev/null || true
 # Stop a running desktop first so it doesn't overwrite the config files we write
 systemctl stop selkies-desktop 2>/dev/null || true
 mkdir -p /root/.config/xfce4
 cat > /root/.config/xfce4/helpers.rc <<'EOF'
 TerminalEmulator=xfce4-terminal
-WebBrowser=epiphany
+WebBrowser=debian-sensible-browser
 EOF
 
-echo "==> [4/9] Applying dark theme everywhere (GTK2/GTK3, XFCE, Thunar, terminal, Epiphany)"
+echo "==> [4/9] Applying dark theme everywhere (GTK2/GTK3, XFCE, Thunar, terminal, Falkon)"
 # Fall back if Arc-Dark / Papirus are not installed
 if [[ ! -d /usr/share/themes/$GTK_THEME_NAME ]]; then
   echo "    $GTK_THEME_NAME not found, falling back to Adwaita-dark"
@@ -133,7 +144,7 @@ for d in /usr/share/icons/*/; do
   [[ -f "$d/index.theme" ]] && gtk-update-icon-cache -f -q "$d" 2>/dev/null || true
 done
 
-# GTK3 apps (Thunar, panel, terminal, Epiphany UI, etc.)
+# GTK3 apps (Thunar, panel, terminal, etc.)
 mkdir -p /root/.config/gtk-3.0
 cat > /root/.config/gtk-3.0/settings.ini <<EOF
 [Settings]
@@ -205,8 +216,8 @@ ColorCursor=#d3dae3
 MiscAlwaysShowTabs=FALSE
 EOF
 
-# Epiphany follows the GTK dark theme set above (gtk-application-prefer-dark-theme=1),
-# so no extra browser config is needed.
+# Falkon: UI follows the GTK dark theme via QT_QPA_PLATFORMTHEME (set in the
+# desktop service below). Web pages are darkened via QTWEBENGINE_CHROMIUM_FLAGS.
 
 echo "==> [5/9] Downloading Selkies"
 TMP_TAR="$(mktemp /tmp/selkies.XXXXXX.tar.gz)"
@@ -234,6 +245,15 @@ EOF
 chmod 600 "$CERT_DIR/selkies.env"
 
 echo "==> [8/9] Creating systemd services (auto-start on boot)"
+
+# Chromium flags for Falkon's QtWebEngine engine:
+#   --no-sandbox  : required because everything runs as root
+#   --disable-gpu : there is no GPU in Xvfb
+QT_FLAGS="--no-sandbox --disable-gpu"
+if [[ "$FALKON_DARK_PAGES" == "1" ]]; then
+  QT_FLAGS="$QT_FLAGS --blink-settings=forceDarkModeEnabled=true"
+fi
+
 cat > /etc/systemd/system/selkies-xvfb.service <<EOF
 [Unit]
 Description=Xvfb virtual display for Selkies
@@ -247,6 +267,7 @@ Restart=always
 WantedBy=multi-user.target
 EOF
 
+# NOTE: values containing spaces must be wrapped in quotes in systemd Environment=
 cat > /etc/systemd/system/selkies-desktop.service <<EOF
 [Unit]
 Description=XFCE desktop session for Selkies
@@ -257,8 +278,10 @@ Requires=selkies-xvfb.service
 Environment=DISPLAY=$DISPLAY_NUM
 Environment=HOME=/root
 Environment=GTK_THEME=$GTK_THEME_NAME
-# Epiphany/WebKitGTK: no GPU in Xvfb, so disable GPU compositing to avoid blank pages
-Environment=WEBKIT_DISABLE_COMPOSITING_MODE=1
+# Qt apps (Falkon) follow the GTK dark theme
+Environment=QT_QPA_PLATFORMTHEME=gtk3
+# QtWebEngine flags (root-safe, no GPU, optional dark web pages)
+Environment="QTWEBENGINE_CHROMIUM_FLAGS=$QT_FLAGS"
 ExecStartPre=/bin/sleep 2
 ExecStartPre=-/usr/bin/pulseaudio --start --exit-idle-time=-1
 ExecStart=/usr/bin/dbus-launch --exit-with-session /usr/bin/startxfce4
@@ -306,7 +329,7 @@ echo
 echo "Done. Open:  https://$SERVER_IP:$PORT"
 echo "Login:       $AUTH_USER / $AUTH_PASS"
 echo "Theme:       $GTK_THEME_NAME (icons: $ICON_THEME_NAME, Thunar zoom: ${THUNAR_ZOOM}%)"
-echo "Browser:     Epiphany (GNOME Web)"
+echo "Browser:     Falkon (dark UI; dark web pages: $([[ "$FALKON_DARK_PAGES" == "1" ]] && echo on || echo off))"
 echo "(Accept the self-signed certificate warning: Advanced -> Proceed)"
 echo
 echo "Useful commands:"
