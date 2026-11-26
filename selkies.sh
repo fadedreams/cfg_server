@@ -6,8 +6,8 @@
 #               bash selkies.sh 7.7.7.7:8089
 # (IP optional; falls back to DEFAULT_SERVER_IP. Port optional; falls back to DEFAULT_PORT)
 # Result: https://<SERVER_IP>:<PORT>  (login with the user/password below)
-# Includes: XFCE, terminal, Firefox, openssl, systemd services, DARK THEME,
-#           crisp SVG icons (Papirus-Dark) + sane icon sizes in Thunar
+# Includes: XFCE, terminal, Epiphany (GNOME Web), openssl, systemd services,
+#           DARK THEME, crisp SVG icons (Papirus-Dark) + sane icon sizes in Thunar
 # =============================================================================
 set -euo pipefail
 
@@ -78,15 +78,8 @@ apt-get install -y \
 apt-get install -y arc-theme || echo "    arc-theme not available, will fall back"
 apt-get install -y papirus-icon-theme || echo "    papirus-icon-theme not available, will fall back"
 
-echo "==> [2/9] Installing Firefox from Mozilla's apt repo (not the snap)"
-install -d -m 0755 /etc/apt/keyrings
-wget -q https://packages.mozilla.org/apt/repo-signing-key.gpg -O /etc/apt/keyrings/packages.mozilla.org.asc
-echo "deb [signed-by=/etc/apt/keyrings/packages.mozilla.org.asc] https://packages.mozilla.org/apt mozilla main" \
-  > /etc/apt/sources.list.d/mozilla.list
-printf 'Package: *\nPin: origin packages.mozilla.org\nPin-Priority: 1000\n' \
-  > /etc/apt/preferences.d/mozilla
-apt-get update
-apt-get install -y firefox
+echo "==> [2/9] Installing Epiphany (GNOME Web, lightweight browser)"
+apt-get install -y epiphany-browser
 
 echo "==> [3/9] Setting default terminal and browser for XFCE"
 update-alternatives --set x-terminal-emulator /usr/bin/xfce4-terminal.wrapper 2>/dev/null || true
@@ -95,10 +88,10 @@ systemctl stop selkies-desktop 2>/dev/null || true
 mkdir -p /root/.config/xfce4
 cat > /root/.config/xfce4/helpers.rc <<'EOF'
 TerminalEmulator=xfce4-terminal
-WebBrowser=firefox
+WebBrowser=epiphany
 EOF
 
-echo "==> [4/9] Applying dark theme everywhere (GTK2/GTK3, XFCE, Thunar, terminal, Firefox)"
+echo "==> [4/9] Applying dark theme everywhere (GTK2/GTK3, XFCE, Thunar, terminal, Epiphany)"
 # Fall back if Arc-Dark / Papirus are not installed
 if [[ ! -d /usr/share/themes/$GTK_THEME_NAME ]]; then
   echo "    $GTK_THEME_NAME not found, falling back to Adwaita-dark"
@@ -114,7 +107,7 @@ for d in /usr/share/icons/*/; do
   [[ -f "$d/index.theme" ]] && gtk-update-icon-cache -f -q "$d" 2>/dev/null || true
 done
 
-# GTK3 apps (Thunar, panel, terminal, Firefox UI, etc.)
+# GTK3 apps (Thunar, panel, terminal, Epiphany UI, etc.)
 mkdir -p /root/.config/gtk-3.0
 cat > /root/.config/gtk-3.0/settings.ini <<EOF
 [Settings]
@@ -186,21 +179,8 @@ ColorCursor=#d3dae3
 MiscAlwaysShowTabs=FALSE
 EOF
 
-# Firefox: dark browser UI + tell websites the user prefers dark
-FF_POLICY_DIR=/usr/lib/firefox/distribution
-mkdir -p "$FF_POLICY_DIR"
-cat > "$FF_POLICY_DIR/policies.json" <<'EOF'
-{
-  "policies": {
-    "DontCheckDefaultBrowser": true,
-    "Preferences": {
-      "browser.theme.toolbar-theme": { "Value": 0, "Status": "default" },
-      "browser.theme.content-theme": { "Value": 0, "Status": "default" },
-      "layout.css.prefers-color-scheme.content-override": { "Value": 0, "Status": "default" }
-    }
-  }
-}
-EOF
+# Epiphany follows the GTK dark theme set above (gtk-application-prefer-dark-theme=1),
+# so no extra browser config is needed.
 
 echo "==> [5/9] Downloading Selkies"
 TMP_TAR="$(mktemp /tmp/selkies.XXXXXX.tar.gz)"
@@ -251,6 +231,8 @@ Requires=selkies-xvfb.service
 Environment=DISPLAY=$DISPLAY_NUM
 Environment=HOME=/root
 Environment=GTK_THEME=$GTK_THEME_NAME
+# Epiphany/WebKitGTK: no GPU in Xvfb, so disable GPU compositing to avoid blank pages
+Environment=WEBKIT_DISABLE_COMPOSITING_MODE=1
 ExecStartPre=/bin/sleep 2
 ExecStartPre=-/usr/bin/pulseaudio --start --exit-idle-time=-1
 ExecStart=/usr/bin/dbus-launch --exit-with-session /usr/bin/startxfce4
@@ -298,6 +280,7 @@ echo
 echo "Done. Open:  https://$SERVER_IP:$PORT"
 echo "Login:       $AUTH_USER / $AUTH_PASS"
 echo "Theme:       $GTK_THEME_NAME (icons: $ICON_THEME_NAME, Thunar zoom: ${THUNAR_ZOOM}%)"
+echo "Browser:     Epiphany (GNOME Web)"
 echo "(Accept the self-signed certificate warning: Advanced -> Proceed)"
 echo
 echo "Useful commands:"
